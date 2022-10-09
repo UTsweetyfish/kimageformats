@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+# Disable fixfilepath, as it triggers build failures.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all reproducible=-fixfilepath
+
+include /usr/share/dpkg/architecture.mk
+
+# kimageformats-read-psd fails on big endian architectures
+ifeq (big,$(DEB_HOST_ARCH_ENDIAN))
+  fail_param := || true
+endif
+
+%:
+	dh $@ --with kf5,pkgkde_symbolshelper --buildsystem kf5 --without build_stamp
+
+override_dh_auto_test:
+	xvfb-run -a dh_auto_test $(fail_param)
