@@ -12,6 +12,8 @@
 #include <QColorSpace>
 
 #include "avif_p.h"
+#include "util_p.h"
+
 #include <cfloat>
 
 QAVIFHandler::QAVIFHandler()
@@ -40,6 +42,11 @@ bool QAVIFHandler::canRead() const
 
     if (m_parseState != ParseAvifError) {
         setFormat("avif");
+
+        if (m_parseState == ParseAvifFinished) {
+            return false;
+        }
+
         return true;
     }
     return false;
@@ -56,7 +63,7 @@ bool QAVIFHandler::canRead(QIODevice *device)
     }
 
     avifROData input;
-    input.data = (const uint8_t *)header.constData();
+    input.data = reinterpret_cast<const uint8_t *>(header.constData());
     input.size = header.size();
 
     if (avifPeekCompatibleFileType(&input)) {
@@ -67,7 +74,7 @@ bool QAVIFHandler::canRead(QIODevice *device)
 
 bool QAVIFHandler::ensureParsed() const
 {
-    if (m_parseState == ParseAvifSuccess) {
+    if (m_parseState == ParseAvifSuccess || m_parseState == ParseAvifMetadata || m_parseState == ParseAvifFinished) {
         return true;
     }
     if (m_parseState == ParseAvifError) {
@@ -79,6 +86,28 @@ bool QAVIFHandler::ensureParsed() const
     return that->ensureDecoder();
 }
 
+bool QAVIFHandler::ensureOpened() const
+{
+    if (m_parseState == ParseAvifSuccess || m_parseState == ParseAvifFinished) {
+        return true;
+    }
+    if (m_parseState == ParseAvifError) {
+        return false;
+    }
+
+    QAVIFHandler *that = const_cast<QAVIFHandler *>(this);
+    if (ensureParsed()) {
+        if (m_parseState == ParseAvifMetadata) {
+            bool success = that->jumpToNextImage();
+            that->m_parseState = success ? ParseAvifSuccess : ParseAvifError;
+            return success;
+        }
+    }
+
+    that->m_parseState = ParseAvifError;
+    return false;
+}
+
 bool QAVIFHandler::ensureDecoder()
 {
     if (m_decoder) {
@@ -87,7 +116,7 @@ bool QAVIFHandler::ensureDecoder()
 
     m_rawData = device()->readAll();
 
-    m_rawAvifData.data = (const uint8_t *)m_rawData.constData();
+    m_rawAvifData.data = reinterpret_cast<const uint8_t *>(m_rawData.constData());
     m_rawAvifData.size = m_rawData.size();
 
     if (avifPeekCompatibleFileType(&m_rawAvifData) == AVIF_FALSE) {
@@ -97,12 +126,19 @@ bool QAVIFHandler::ensureDecoder()
 
     m_decoder = avifDecoderCreate();
 
+    m_decoder->ignoreExif = AVIF_TRUE;
+    m_decoder->ignoreXMP = AVIF_TRUE;
+
 #if AVIF_VERSION >= 80400
     m_decoder->maxThreads = qBound(1, QThread::idealThreadCount(), 64);
 #endif
 
 #if AVIF_VERSION >= 90100
     m_decoder->strictFlags = AVIF_STRICT_DISABLED;
+#endif
+
+#if AVIF_VERSION >= 110000
+    m_decoder->imageDimensionLimit = 65535;
 #endif
 
     avifResult decodeResult;
@@ -127,39 +163,58 @@ bool QAVIFHandler::ensureDecoder()
         return false;
     }
 
-    decodeResult = avifDecoderNextImage(m_decoder);
+    m_container_width = m_decoder->image->width;
+    m_container_height = m_decoder->image->height;
 
-    if (decodeResult == AVIF_RESULT_OK) {
-        m_container_width = m_decoder->image->width;
-        m_container_height = m_decoder->image->height;
-
-        if ((m_container_width > 32768) || (m_container_height > 32768)) {
-            qWarning("AVIF image (%dx%d) is too large!", m_container_width, m_container_height);
-            m_parseState = ParseAvifError;
-            return false;
-        }
-
-        if ((m_container_width == 0) || (m_container_height == 0)) {
-            qWarning("Empty image, nothing to decode");
-            m_parseState = ParseAvifError;
-            return false;
-        }
-
-        m_parseState = ParseAvifSuccess;
-        if (decode_one_frame()) {
-            return true;
-        } else {
-            m_parseState = ParseAvifError;
-            return false;
-        }
-    } else {
-        qWarning("ERROR: Failed to decode image: %s", avifResultToString(decodeResult));
+    if ((m_container_width > 65535) || (m_container_height > 65535)) {
+        qWarning("AVIF image (%dx%d) is too large!", m_container_width, m_container_height);
+        m_parseState = ParseAvifError;
+        return false;
     }
 
-    avifDecoderDestroy(m_decoder);
-    m_decoder = nullptr;
-    m_parseState = ParseAvifError;
-    return false;
+    if ((m_container_width == 0) || (m_container_height == 0)) {
+        qWarning("Empty image, nothing to decode");
+        m_parseState = ParseAvifError;
+        return false;
+    }
+
+    if (m_container_width > ((16384 * 16384) / m_container_height)) {
+        qWarning("AVIF image (%dx%d) has more than 256 megapixels!", m_container_width, m_container_height);
+        m_parseState = ParseAvifError;
+        return false;
+    }
+
+    // calculate final dimensions with crop and rotate operations applied
+    int new_width = m_container_width;
+    int new_height = m_container_height;
+
+    if (m_decoder->image->transformFlags & AVIF_TRANSFORM_CLAP) {
+        if ((m_decoder->image->clap.widthD > 0) && (m_decoder->image->clap.heightD > 0) && (m_decoder->image->clap.horizOffD > 0)
+            && (m_decoder->image->clap.vertOffD > 0)) {
+            int crop_width = (int)((double)(m_decoder->image->clap.widthN) / (m_decoder->image->clap.widthD) + 0.5);
+            if (crop_width < new_width && crop_width > 0) {
+                new_width = crop_width;
+            }
+            int crop_height = (int)((double)(m_decoder->image->clap.heightN) / (m_decoder->image->clap.heightD) + 0.5);
+            if (crop_height < new_height && crop_height > 0) {
+                new_height = crop_height;
+            }
+        }
+    }
+
+    if (m_decoder->image->transformFlags & AVIF_TRANSFORM_IROT) {
+        if (m_decoder->image->irot.angle == 1 || m_decoder->image->irot.angle == 3) {
+            int tmp = new_width;
+            new_width = new_height;
+            new_height = tmp;
+        }
+    }
+
+    m_estimated_dimensions.setWidth(new_width);
+    m_estimated_dimensions.setHeight(new_height);
+
+    m_parseState = ParseAvifMetadata;
+    return true;
 }
 
 bool QAVIFHandler::decode_one_frame()
@@ -186,13 +241,13 @@ bool QAVIFHandler::decode_one_frame()
         }
     } else {
         if (loadalpha) {
-            resultformat = QImage::Format_RGBA8888;
+            resultformat = QImage::Format_ARGB32;
         } else {
-            resultformat = QImage::Format_RGBX8888;
+            resultformat = QImage::Format_RGB32;
         }
     }
-    QImage result(m_decoder->image->width, m_decoder->image->height, resultformat);
 
+    QImage result = imageAlloc(m_decoder->image->width, m_decoder->image->height, resultformat);
     if (result.isNull()) {
         qWarning("Memory cannot be allocated");
         return false;
@@ -200,7 +255,7 @@ bool QAVIFHandler::decode_one_frame()
 
     QColorSpace colorspace;
     if (m_decoder->image->icc.data && (m_decoder->image->icc.size > 0)) {
-        const QByteArray icc_data((const char *)m_decoder->image->icc.data, (int)m_decoder->image->icc.size);
+        const QByteArray icc_data(reinterpret_cast<const char *>(m_decoder->image->icc.data), m_decoder->image->icc.size);
         colorspace = QColorSpace::fromIccProfile(icc_data);
         if (!colorspace.isValid()) {
             qWarning("AVIF image has Qt-unsupported or invalid ICC profile!");
@@ -279,14 +334,16 @@ bool QAVIFHandler::decode_one_frame()
         rgb.depth = 16;
         rgb.format = AVIF_RGB_FORMAT_RGBA;
 
-        if (!loadalpha) {
-            if (m_decoder->image->yuvFormat == AVIF_PIXEL_FORMAT_YUV400) {
-                resultformat = QImage::Format_Grayscale16;
-            }
+        if (!loadalpha && (m_decoder->image->yuvFormat == AVIF_PIXEL_FORMAT_YUV400)) {
+            resultformat = QImage::Format_Grayscale16;
         }
     } else {
         rgb.depth = 8;
-        rgb.format = AVIF_RGB_FORMAT_RGBA;
+#if Q_BYTE_ORDER == Q_LITTLE_ENDIAN
+        rgb.format = AVIF_RGB_FORMAT_BGRA;
+#else
+        rgb.format = AVIF_RGB_FORMAT_ARGB;
+#endif
 
 #if AVIF_VERSION >= 80400
         if (m_decoder->imageCount > 1) {
@@ -295,14 +352,8 @@ bool QAVIFHandler::decode_one_frame()
         }
 #endif
 
-        if (loadalpha) {
-            resultformat = QImage::Format_ARGB32;
-        } else {
-            if (m_decoder->image->yuvFormat == AVIF_PIXEL_FORMAT_YUV400) {
-                resultformat = QImage::Format_Grayscale8;
-            } else {
-                resultformat = QImage::Format_RGB32;
-            }
+        if (!loadalpha && (m_decoder->image->yuvFormat == AVIF_PIXEL_FORMAT_YUV400)) {
+            resultformat = QImage::Format_Grayscale8;
         }
     }
 
@@ -393,13 +444,15 @@ bool QAVIFHandler::decode_one_frame()
         m_current_image = result.convertToFormat(resultformat);
     }
 
+    m_estimated_dimensions = m_current_image.size();
+
     m_must_jump_to_next_image = false;
     return true;
 }
 
 bool QAVIFHandler::read(QImage *image)
 {
-    if (!ensureParsed()) {
+    if (!ensureOpened()) {
         return false;
     }
 
@@ -410,6 +463,13 @@ bool QAVIFHandler::read(QImage *image)
     *image = m_current_image;
     if (imageCount() >= 2) {
         m_must_jump_to_next_image = true;
+        if (m_decoder->imageIndex >= m_decoder->imageCount - 1) {
+            // all frames in animation have been read
+            m_parseState = ParseAvifFinished;
+        }
+    } else {
+        // the static image has been read
+        m_parseState = ParseAvifFinished;
     }
     return true;
 }
@@ -417,13 +477,42 @@ bool QAVIFHandler::read(QImage *image)
 bool QAVIFHandler::write(const QImage &image)
 {
     if (image.format() == QImage::Format_Invalid) {
-        qWarning("No image data to save");
+        qWarning("No image data to save!");
         return false;
     }
 
-    if ((image.width() > 32768) || (image.height() > 32768)) {
-        qWarning("Image is too large");
+    if ((image.width() > 0) && (image.height() > 0)) {
+        if ((image.width() > 65535) || (image.height() > 65535)) {
+            qWarning("Image (%dx%d) is too large to save!", image.width(), image.height());
+            return false;
+        }
+
+        if (image.width() > ((16384 * 16384) / image.height())) {
+            qWarning("Image (%dx%d) will not be saved because it has more than 256 megapixels!", image.width(), image.height());
+            return false;
+        }
+
+        if ((image.width() > 32768) || (image.height() > 32768)) {
+            qWarning("Image (%dx%d) has a dimension above 32768 pixels, saved AVIF may not work in other software!", image.width(), image.height());
+        }
+    } else {
+        qWarning("Image has zero dimension!");
         return false;
+    }
+
+    const char *encoder_name = avifCodecName(AVIF_CODEC_CHOICE_AUTO, AVIF_CODEC_FLAG_CAN_ENCODE);
+    if (!encoder_name) {
+        qWarning("Cannot save AVIF images because libavif was built without AV1 encoders!");
+        return false;
+    }
+
+    bool lossless = false;
+    if (m_quality >= 100) {
+        if (avifCodecName(AVIF_CODEC_CHOICE_AOM, AVIF_CODEC_FLAG_CAN_ENCODE)) {
+            lossless = true;
+        } else {
+            qWarning("You are using %s encoder. It is recommended to enable libAOM encoder in libavif to use lossless compression.", encoder_name);
+        }
     }
 
     int maxQuantizer = AVIF_QUANTIZER_WORST_QUALITY * (100 - qBound(0, m_quality, 100)) / 100;
@@ -618,43 +707,47 @@ bool QAVIFHandler::write(const QImage &image)
 
             // in case primaries or trc were not identified
             if ((primaries_to_save == 2) || (transfer_to_save == 2)) {
-                // upgrade image to higher bit depth
-                if (save_depth == 8) {
-                    save_depth = 10;
-                    if (tmpcolorimage.hasAlphaChannel()) {
-                        tmpcolorimage = tmpcolorimage.convertToFormat(QImage::Format_RGBA64);
-                    } else {
-                        tmpcolorimage = tmpcolorimage.convertToFormat(QImage::Format_RGBX64);
+                if (lossless) {
+                    iccprofile = tmpcolorimage.colorSpace().iccProfile();
+                } else {
+                    // upgrade image to higher bit depth
+                    if (save_depth == 8) {
+                        save_depth = 10;
+                        if (tmpcolorimage.hasAlphaChannel()) {
+                            tmpcolorimage = tmpcolorimage.convertToFormat(QImage::Format_RGBA64);
+                        } else {
+                            tmpcolorimage = tmpcolorimage.convertToFormat(QImage::Format_RGBX64);
+                        }
                     }
-                }
 
-                if ((primaries_to_save == 2) && (transfer_to_save != 2)) { // other primaries but known trc
-                    primaries_to_save = (avifColorPrimaries)1; // AVIF_COLOR_PRIMARIES_BT709
-                    matrix_to_save = (avifMatrixCoefficients)1; // AVIF_MATRIX_COEFFICIENTS_BT709
+                    if ((primaries_to_save == 2) && (transfer_to_save != 2)) { // other primaries but known trc
+                        primaries_to_save = (avifColorPrimaries)1; // AVIF_COLOR_PRIMARIES_BT709
+                        matrix_to_save = (avifMatrixCoefficients)1; // AVIF_MATRIX_COEFFICIENTS_BT709
 
-                    switch (transfer_to_save) {
-                    case 8: // AVIF_TRANSFER_CHARACTERISTICS_LINEAR
-                        tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, QColorSpace::TransferFunction::Linear));
-                        break;
-                    case 4: // AVIF_TRANSFER_CHARACTERISTICS_BT470M
-                        tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, 2.2f));
-                        break;
-                    case 5: // AVIF_TRANSFER_CHARACTERISTICS_BT470BG
-                        tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, 2.8f));
-                        break;
-                    default: // AVIF_TRANSFER_CHARACTERISTICS_SRGB + any other
-                        tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, QColorSpace::TransferFunction::SRgb));
+                        switch (transfer_to_save) {
+                        case 8: // AVIF_TRANSFER_CHARACTERISTICS_LINEAR
+                            tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, QColorSpace::TransferFunction::Linear));
+                            break;
+                        case 4: // AVIF_TRANSFER_CHARACTERISTICS_BT470M
+                            tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, 2.2f));
+                            break;
+                        case 5: // AVIF_TRANSFER_CHARACTERISTICS_BT470BG
+                            tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, 2.8f));
+                            break;
+                        default: // AVIF_TRANSFER_CHARACTERISTICS_SRGB + any other
+                            tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, QColorSpace::TransferFunction::SRgb));
+                            transfer_to_save = (avifTransferCharacteristics)13;
+                            break;
+                        }
+                    } else if ((primaries_to_save != 2) && (transfer_to_save == 2)) { // recognized primaries but other trc
                         transfer_to_save = (avifTransferCharacteristics)13;
-                        break;
+                        tmpcolorimage.convertToColorSpace(tmpcolorimage.colorSpace().withTransferFunction(QColorSpace::TransferFunction::SRgb));
+                    } else { // unrecognized profile
+                        primaries_to_save = (avifColorPrimaries)1; // AVIF_COLOR_PRIMARIES_BT709
+                        transfer_to_save = (avifTransferCharacteristics)13;
+                        matrix_to_save = (avifMatrixCoefficients)1; // AVIF_MATRIX_COEFFICIENTS_BT709
+                        tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, QColorSpace::TransferFunction::SRgb));
                     }
-                } else if ((primaries_to_save != 2) && (transfer_to_save == 2)) { // recognized primaries but other trc
-                    transfer_to_save = (avifTransferCharacteristics)13;
-                    tmpcolorimage.convertToColorSpace(tmpcolorimage.colorSpace().withTransferFunction(QColorSpace::TransferFunction::SRgb));
-                } else { // unrecognized profile
-                    primaries_to_save = (avifColorPrimaries)1; // AVIF_COLOR_PRIMARIES_BT709
-                    transfer_to_save = (avifTransferCharacteristics)13;
-                    matrix_to_save = (avifMatrixCoefficients)1; // AVIF_MATRIX_COEFFICIENTS_BT709
-                    tmpcolorimage.convertToColorSpace(QColorSpace(QColorSpace::Primaries::SRgb, QColorSpace::TransferFunction::SRgb));
                 }
             }
         } else { // profile is unsupported by Qt
@@ -664,6 +757,9 @@ bool QAVIFHandler::write(const QImage &image)
             }
         }
 
+        if (lossless && pixel_format == AVIF_PIXEL_FORMAT_YUV444) {
+            matrix_to_save = (avifMatrixCoefficients)0;
+        }
         avif = avifImageCreate(tmpcolorimage.width(), tmpcolorimage.height(), save_depth, pixel_format);
         avif->matrixCoefficients = matrix_to_save;
 
@@ -671,7 +767,7 @@ bool QAVIFHandler::write(const QImage &image)
         avif->transferCharacteristics = transfer_to_save;
 
         if (iccprofile.size() > 0) {
-            avifImageSetProfileICC(avif, (const uint8_t *)iccprofile.constData(), iccprofile.size());
+            avifImageSetProfileICC(avif, reinterpret_cast<const uint8_t *>(iccprofile.constData()), iccprofile.size());
         }
 
         avifRGBImage rgb;
@@ -682,9 +778,7 @@ bool QAVIFHandler::write(const QImage &image)
         if (save_depth > 8) { // 10bit depth
             rgb.depth = 16;
 
-            if (tmpcolorimage.hasAlphaChannel()) {
-                avif->alphaRange = AVIF_RANGE_FULL;
-            } else {
+            if (!tmpcolorimage.hasAlphaChannel()) {
                 rgb.ignoreAlpha = AVIF_TRUE;
             }
 
@@ -694,7 +788,6 @@ bool QAVIFHandler::write(const QImage &image)
 
             if (tmpcolorimage.hasAlphaChannel()) {
                 rgb.format = AVIF_RGB_FORMAT_RGBA;
-                avif->alphaRange = AVIF_RANGE_FULL;
             } else {
                 rgb.format = AVIF_RGB_FORMAT_RGB;
             }
@@ -718,14 +811,14 @@ bool QAVIFHandler::write(const QImage &image)
         encoder->maxQuantizerAlpha = maxQuantizerAlpha;
     }
 
-    encoder->speed = 7;
+    encoder->speed = 6;
 
     res = avifEncoderWrite(encoder, avif, &raw);
     avifEncoderDestroy(encoder);
     avifImageDestroy(avif);
 
     if (res == AVIF_RESULT_OK) {
-        qint64 status = device()->write((const char *)raw.data, raw.size);
+        qint64 status = device()->write(reinterpret_cast<const char *>(raw.data), raw.size);
         avifRWDataFree(&raw);
 
         if (status > 0) {
@@ -753,7 +846,7 @@ QVariant QAVIFHandler::option(ImageOption option) const
 
     switch (option) {
     case Size:
-        return m_current_image.size();
+        return m_estimated_dimensions;
     case Animation:
         if (imageCount() >= 2) {
             return true;
@@ -809,6 +902,14 @@ int QAVIFHandler::currentImageNumber() const
         return 0;
     }
 
+    if (m_parseState == ParseAvifMetadata) {
+        if (m_decoder->imageCount >= 2) {
+            return -1;
+        } else {
+            return 0;
+        }
+    }
+
     return m_decoder->imageIndex;
 }
 
@@ -818,12 +919,15 @@ bool QAVIFHandler::jumpToNextImage()
         return false;
     }
 
-    if (m_decoder->imageCount < 2) {
-        return true;
-    }
+    if (m_decoder->imageIndex >= 0) {
+        if (m_decoder->imageCount < 2) {
+            m_parseState = ParseAvifSuccess;
+            return true;
+        }
 
-    if (m_decoder->imageIndex >= m_decoder->imageCount - 1) { // start from beginning
-        avifDecoderReset(m_decoder);
+        if (m_decoder->imageIndex >= m_decoder->imageCount - 1) { // start from beginning
+            avifDecoderReset(m_decoder);
+        }
     }
 
     avifResult decodeResult = avifDecoderNextImage(m_decoder);
@@ -846,6 +950,7 @@ bool QAVIFHandler::jumpToNextImage()
     }
 
     if (decode_one_frame()) {
+        m_parseState = ParseAvifSuccess;
         return true;
     } else {
         m_parseState = ParseAvifError;
@@ -861,17 +966,21 @@ bool QAVIFHandler::jumpToImage(int imageNumber)
 
     if (m_decoder->imageCount < 2) { // not an animation
         if (imageNumber == 0) {
-            return true;
-        } else {
-            return false;
+            if (ensureOpened()) {
+                m_parseState = ParseAvifSuccess;
+                return true;
+            }
         }
+        return false;
     }
 
     if (imageNumber < 0 || imageNumber >= m_decoder->imageCount) { // wrong index
         return false;
     }
 
-    if (imageNumber == m_decoder->imageCount) { // we are here already
+    if (imageNumber == m_decoder->imageIndex) { // we are here already
+        m_must_jump_to_next_image = false;
+        m_parseState = ParseAvifSuccess;
         return true;
     }
 
@@ -895,6 +1004,7 @@ bool QAVIFHandler::jumpToImage(int imageNumber)
     }
 
     if (decode_one_frame()) {
+        m_parseState = ParseAvifSuccess;
         return true;
     } else {
         m_parseState = ParseAvifError;
@@ -904,7 +1014,7 @@ bool QAVIFHandler::jumpToImage(int imageNumber)
 
 int QAVIFHandler::nextImageDelay() const
 {
-    if (!ensureParsed()) {
+    if (!ensureOpened()) {
         return 0;
     }
 
@@ -929,7 +1039,8 @@ int QAVIFHandler::loopCount() const
         return 0;
     }
 
-    return 1;
+    // Endless loop to work around https://github.com/AOMediaCodec/libavif/issues/347
+    return -1;
 }
 
 QPointF QAVIFHandler::CompatibleChromacity(qreal chrX, qreal chrY)
@@ -946,12 +1057,26 @@ QPointF QAVIFHandler::CompatibleChromacity(qreal chrX, qreal chrY)
 
 QImageIOPlugin::Capabilities QAVIFPlugin::capabilities(QIODevice *device, const QByteArray &format) const
 {
+    static const bool isAvifDecoderAvailable(avifCodecName(AVIF_CODEC_CHOICE_AUTO, AVIF_CODEC_FLAG_CAN_DECODE) != nullptr);
+    static const bool isAvifEncoderAvailable(avifCodecName(AVIF_CODEC_CHOICE_AUTO, AVIF_CODEC_FLAG_CAN_ENCODE) != nullptr);
+
     if (format == "avif") {
-        return Capabilities(CanRead | CanWrite);
+        Capabilities format_cap;
+        if (isAvifDecoderAvailable) {
+            format_cap |= CanRead;
+        }
+        if (isAvifEncoderAvailable) {
+            format_cap |= CanWrite;
+        }
+        return format_cap;
     }
 
     if (format == "avifs") {
-        return Capabilities(CanRead);
+        Capabilities format_cap;
+        if (isAvifDecoderAvailable) {
+            format_cap |= CanRead;
+        }
+        return format_cap;
     }
 
     if (!format.isEmpty()) {
@@ -962,10 +1087,10 @@ QImageIOPlugin::Capabilities QAVIFPlugin::capabilities(QIODevice *device, const 
     }
 
     Capabilities cap;
-    if (device->isReadable() && QAVIFHandler::canRead(device)) {
+    if (device->isReadable() && QAVIFHandler::canRead(device) && isAvifDecoderAvailable) {
         cap |= CanRead;
     }
-    if (device->isWritable()) {
+    if (device->isWritable() && isAvifEncoderAvailable) {
         cap |= CanWrite;
     }
     return cap;

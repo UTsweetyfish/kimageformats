@@ -3,19 +3,21 @@ Section: kde
 Priority: optional
 Maintainer: Debian Qt/KDE Maintainers <debian-qt-kde@lists.debian.org>
 Uploaders: Aurélien COUDERC <coucouf@debian.org>,
-           Norbert Preining <norbert@preining.info>,
 Build-Depends: cmake (>= 3.16~),
                debhelper-compat (= 13),
-               extra-cmake-modules (>= 5.90.0~),
+               dh-sequence-kf5,
+               extra-cmake-modules (>= 5.103.0~),
                libavif-dev (>= 0.8.2~),
+               libheif-dev (>= 1.10.0~),
+               libjxl-dev (>= 0.6.1~) [linux-any],
                libkf5archive-dev,
-               libopenexr-dev,
+               libopenexr-dev (>= 3.0~),
+               libraw-dev (>= 0.20.2~),
                pkg-config,
-               pkg-kde-tools (>= 0.15.15ubuntu1~),
                qtbase5-dev (>= 5.15.2~),
-               xauth,
-               xvfb,
-Standards-Version: 4.6.0
+               xauth <!nocheck>,
+               xvfb <!nocheck>,
+Standards-Version: 4.6.2
 Homepage: https://invent.kde.org/frameworks/kimageformats
 Vcs-Browser: https://salsa.debian.org/qt-kde-team/kde/kimageformats
 Vcs-Git: https://salsa.debian.org/qt-kde-team/kde/kimageformats.git
@@ -23,7 +25,7 @@ Rules-Requires-Root: no
 
 Package: kimageformat-plugins
 Architecture: any
-Depends: ${misc:Depends}, ${shlibs:Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends},
 Description: additional image format plugins for QtGui
  This framework provides additional image format plugins for QtGui.  As
  such it is not required for the compilation of any other software, but

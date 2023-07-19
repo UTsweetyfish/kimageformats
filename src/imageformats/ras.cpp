@@ -8,6 +8,7 @@
 */
 
 #include "ras_p.h"
+#include "util_p.h"
 
 #include <QDataStream>
 #include <QDebug>
@@ -102,8 +103,7 @@ static bool LoadRAS(QDataStream &s, const RasHeader &ras, QImage &img)
 {
     s.device()->seek(RasHeader::SIZE);
 
-    // QVector uses some extra space for stuff, hence the 32 here suggested by thiago
-    if (ras.ColorMapLength > std::numeric_limits<int>::max() - 32) {
+    if (ras.ColorMapLength > kMaxQVectorSize) {
         qWarning() << "LoadRAS() unsupported image color map length in file header" << ras.ColorMapLength;
         return false;
     }
@@ -127,8 +127,7 @@ static bool LoadRAS(QDataStream &s, const RasHeader &ras, QImage &img)
         qWarning() << "LoadRAS() mistmatch between height and width" << ras.Width << ras.Height << ras.Length << ras.Depth;
         return false;
     }
-    // QVector uses some extra space for stuff, hence the 32 here suggested by thiago
-    if (ras.Length > std::numeric_limits<int>::max() - 32) {
+    if (ras.Length > kMaxQVectorSize) {
         qWarning() << "LoadRAS() unsupported image length in file header" << ras.Length;
         return false;
     }
@@ -152,8 +151,7 @@ static bool LoadRAS(QDataStream &s, const RasHeader &ras, QImage &img)
     }
 
     // Allocate image
-    img = QImage(ras.Width, ras.Height, QImage::Format_ARGB32);
-
+    img = imageAlloc(ras.Width, ras.Height, QImage::Format_ARGB32);
     if (img.isNull()) {
         return false;
     }

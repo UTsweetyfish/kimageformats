@@ -3,19 +3,19 @@ cmake_minimum_required(VERSION 3.16)
 project(KImageFormats)
 
 include(FeatureSummary)
-find_package(ECM 5.90.0  NO_MODULE)
+find_package(ECM 5.103.0  NO_MODULE)
 set_package_properties(ECM PROPERTIES TYPE REQUIRED DESCRIPTION "Extra CMake Modules." URL "https://commits.kde.org/extra-cmake-modules")
 feature_summary(WHAT REQUIRED_PACKAGES_NOT_FOUND FATAL_ON_MISSING_REQUIRED_PACKAGES)
 
 
-set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
+set(CMAKE_MODULE_PATH ${KImageFormats_SOURCE_DIR}/cmake/find-modules ${ECM_MODULE_PATH})
 
 include(KDEInstallDirs)
 include(KDEFrameworkCompilerSettings NO_POLICY_SCOPE)
 include(KDECMakeSettings)
+
 include(KDEGitCommitHooks)
-
-
+include(ECMDeprecationSettings)
 include(CheckIncludeFiles)
 include(FindPkgConfig)
 
@@ -70,8 +70,18 @@ if(KIMAGEFORMATS_JXL)
 endif()
 add_feature_info(LibJXL LibJXL_FOUND "required for the QImage plugin for JPEG XL images")
 
-add_definitions(-DQT_DISABLE_DEPRECATED_BEFORE=0x050f02)
-add_definitions(-DKF_DISABLE_DEPRECATED_BEFORE_AND_AT=0x055900)
+# note: module FindLibRaw missing from https://invent.kde.org/frameworks/extra-cmake-modules
+find_package(LibRaw 0.20.2)
+set_package_properties(LibRaw PROPERTIES
+    TYPE OPTIONAL
+    PURPOSE "Required for the QImage plugin for RAW images"
+)
+
+ecm_set_disabled_deprecation_versions(
+    QT 5.15.2
+    KF 5.95
+)
+
 add_subdirectory(src)
 if (BUILD_TESTING)
     add_subdirectory(autotests)

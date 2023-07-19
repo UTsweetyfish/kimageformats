@@ -12,6 +12,8 @@
 #include <QVariant>
 #include <QtEndian>
 
+#include <cstring>
+
 namespace
 {
 struct ChunkHeader {
@@ -419,7 +421,7 @@ bool ANIHandler::ensureScanned() const
             }
 
             // FIXME encoding
-            const QString stringValue = QString::fromLocal8Bit(value);
+            const QString stringValue = QString::fromLocal8Bit(value.constData(), std::strlen(value.constData()));
             if (chunkId == "INAM") {
                 mutableThis->m_name = stringValue;
             } else if (chunkId == "IART") {
@@ -517,6 +519,9 @@ bool ANIHandler::canRead(QIODevice *device)
 {
     if (!device) {
         qWarning("ANIHandler::canRead() called with no device");
+        return false;
+    }
+    if (device->isSequential()) {
         return false;
     }
 

@@ -4,15 +4,15 @@
 # Disable fixfilepath, as it triggers build failures.
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all reproducible=-fixfilepath
 
-include /usr/share/dpkg/architecture.mk
-
-# kimageformats-read-psd fails on big endian architectures
-ifeq (big,$(DEB_HOST_ARCH_ENDIAN))
-  fail_param := || true
+ifeq ($(DEB_HOST_ARCH_CPU),i386)
+  export DEB_CXXFLAGS_MAINT_APPEND += -ffloat-store
 endif
 
 %:
-	dh $@ --with kf5,pkgkde_symbolshelper --buildsystem kf5 --without build_stamp
+	dh $@
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DKIMAGEFORMATS_HEIF=ON
 
 override_dh_auto_test:
-	xvfb-run -a dh_auto_test $(fail_param)
+	xvfb-run -a dh_auto_test

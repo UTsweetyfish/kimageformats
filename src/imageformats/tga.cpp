@@ -17,6 +17,7 @@
  */
 
 #include "tga_p.h"
+#include "util_p.h"
 
 #include <assert.h>
 
@@ -172,7 +173,7 @@ struct TgaHeaderInfo {
 static bool LoadTGA(QDataStream &s, const TgaHeader &tga, QImage &img)
 {
     // Create image.
-    img = QImage(tga.width, tga.height, QImage::Format_RGB32);
+    img = imageAlloc(tga.width, tga.height, QImage::Format_RGB32);
     if (img.isNull()) {
         qWarning() << "Failed to allocate image, invalid dimensions?" << QSize(tga.width, tga.height);
         return false;
@@ -184,7 +185,7 @@ static bool LoadTGA(QDataStream &s, const TgaHeader &tga, QImage &img)
     const int numAlphaBits = tga.flags & 0xf;
     // However alpha exists only in the 32 bit format.
     if ((tga.pixel_size == 32) && (tga.flags & 0xf)) {
-        img = QImage(tga.width, tga.height, QImage::Format_ARGB32);
+        img = imageAlloc(tga.width, tga.height, QImage::Format_ARGB32);
         if (img.isNull()) {
             qWarning() << "Failed to allocate image, invalid dimensions?" << QSize(tga.width, tga.height);
             return false;
@@ -429,6 +430,9 @@ bool TGAHandler::write(const QImage &image)
 
     const QImage &img = image;
     const bool hasAlpha = (img.format() == QImage::Format_ARGB32);
+    static constexpr quint8 originTopLeft = TGA_ORIGIN_UPPER + TGA_ORIGIN_LEFT; // 0x20
+    static constexpr quint8 alphaChannel8Bits = 0x08;
+
     for (int i = 0; i < 12; i++) {
         s << targaMagic[i];
     }
@@ -437,7 +441,7 @@ bool TGAHandler::write(const QImage &image)
     s << quint16(img.width()); // width
     s << quint16(img.height()); // height
     s << quint8(hasAlpha ? 32 : 24); // depth (24 bit RGB + 8 bit alpha)
-    s << quint8(hasAlpha ? 0x24 : 0x20); // top left image (0x20) + 8 bit alpha (0x4)
+    s << quint8(hasAlpha ? originTopLeft + alphaChannel8Bits : originTopLeft);   // top left image (0x20) + 8 bit alpha (0x8)
 
     for (int y = 0; y < img.height(); y++) {
         for (int x = 0; x < img.width(); x++) {

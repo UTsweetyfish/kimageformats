@@ -6,6 +6,7 @@
     SPDX-License-Identifier: LGPL-2.1-or-later
 */
 
+#include "util_p.h"
 #include "xcf_p.h"
 
 #include <QDebug>
@@ -16,8 +17,12 @@
 #include <QStack>
 #include <QVector>
 #include <QtEndian>
-#include <stdlib.h>
+#include <QColorSpace>
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#include <QImageReader>
+#endif
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "gimp_p.h"
@@ -134,7 +139,7 @@ public:
         PROP_SAMPLE_POINTS = 39,
         MAX_SUPPORTED_PROPTYPE, // should always be at the end so its value is last + 1
     };
-    Q_ENUM(PropType);
+    Q_ENUM(PropType)
 
     //! Compression type used in layer tiles.
     enum XcfCompressionType {
@@ -144,7 +149,7 @@ public:
         COMPRESS_ZLIB = 2, /* unused */
         COMPRESS_FRACTAL = 3, /* unused */
     };
-    Q_ENUM(XcfCompressionType);
+    Q_ENUM(XcfCompressionType)
 
     enum LayerModeType {
         GIMP_LAYER_MODE_NORMAL_LEGACY,
@@ -211,7 +216,7 @@ public:
         GIMP_LAYER_MODE_PASS_THROUGH,
         GIMP_LAYER_MODE_COUNT,
     };
-    Q_ENUM(LayerModeType);
+    Q_ENUM(LayerModeType)
 
     //! Type of individual layers in an XCF file.
     enum GimpImageType {
@@ -222,7 +227,7 @@ public:
         INDEXED_GIMAGE,
         INDEXEDA_GIMAGE,
     };
-    Q_ENUM(GimpImageType);
+    Q_ENUM(GimpImageType)
 
     //! Type of individual layers in an XCF file.
     enum GimpColorSpace {
@@ -351,6 +356,8 @@ private:
         bool initialized; //!< Is the QImage initialized?
         QImage image; //!< final QImage
 
+        QHash<QString,QByteArray> parasites;    //!< parasites data
+
         XCFImage(void)
             : initialized(false)
         {
@@ -405,6 +412,7 @@ private:
     bool composeTiles(XCFImage &xcf_image);
     void setGrayPalette(QImage &image);
     void setPalette(XCFImage &xcf_image, QImage &image);
+    void setImageParasites(const XCFImage &xcf_image, QImage &image);
     static void assignImageBytes(Layer &layer, uint i, uint j);
     bool loadHierarchy(QDataStream &xcf_io, Layer &layer);
     bool loadLevel(QDataStream &xcf_io, Layer &layer, qint32 bpp);
@@ -665,6 +673,9 @@ bool XCFImageFormat::readXCF(QIODevice *device, QImage *outImage)
         return false;
     }
 
+    // The image was created: now I can set metadata and ICC color profile inside it.
+    setImageParasites(xcf_image, xcf_image.image);
+
     *outImage = xcf_image.image;
     return true;
 }
@@ -715,15 +726,15 @@ bool XCFImageFormat::loadImageProperties(QDataStream &xcf_io, XCFImage &xcf_imag
                 property.readBytes(tag, size);
 
                 quint32 flags;
-                char *data = nullptr;
+                QByteArray data;
                 property >> flags >> data;
 
-                if (tag && strncmp(tag, "gimp-comment", strlen("gimp-comment")) == 0) {
-                    xcf_image.image.setText(QStringLiteral("Comment"), QString::fromUtf8(data));
-                }
+                // WARNING: you cannot add metadata to QImage here because it can be null.
+                // Adding a metadata to a QImage when it is null, does nothing (metas are lost).
+                if(tag) // store metadata for future use
+                    xcf_image.parasites.insert(QString::fromUtf8(tag), data);
 
                 delete[] tag;
-                delete[] data;
             }
             break;
 
@@ -1086,11 +1097,26 @@ bool XCFImageFormat::composeTiles(XCFImage &xcf_image)
     qCDebug(XCFPLUGIN) << "LAYER: height=" << layer.height << ", width=" << layer.width;
     qCDebug(XCFPLUGIN) << "LAYER: rows=" << layer.nrows << ", columns=" << layer.ncols;
 
+    // NOTE: starting from GIMP 2.10, images can be very large. The 32K limit for width and height is obsolete
+    //       and it was changed to 300000 (the same as Photoshop Big image). This plugin was able to open an RGB
+    //       image of 108000x40000 pixels saved with GIMP 2.10
     // SANITY CHECK: Catch corrupted XCF image file where the width or height
     // of a tile is reported are bogus. See Bug# 234030.
-    if (layer.width > 32767 || layer.height > 32767 || (sizeof(void *) == 4 && layer.width * layer.height > 16384 * 16384)) {
+    if (layer.width > 300000 || layer.height > 300000 || (sizeof(void *) == 4 && layer.width * layer.height > 16384 * 16384)) {
         return false;
     }
+
+    // Qt 6 image allocation limit calculation: we have to check the limit here because the image is splitted in
+    // tiles of 64x64 pixels. The required memory to build the image is at least doubled because tiles are loaded
+    // and then the final image is created by copying the tiles inside it.
+    // NOTE: on Windows to open a 10GiB image the plugin uses 28GiB of RAM
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    qint64 channels = 1 + (layer.type == RGB_GIMAGE ? 2 : 0) + (layer.type == RGBA_GIMAGE ? 3 : 0);
+    if (qint64(layer.width) * qint64(layer.height) * channels * 2ll / 1024ll / 1024ll > QImageReader::allocationLimit()) {
+        qCDebug(XCFPLUGIN) << "Rejecting image as it exceeds the current allocation limit of" << QImageReader::allocationLimit() << "megabytes";
+        return false;
+    }
+#endif
 
     layer.image_tiles.resize(layer.nrows);
 
@@ -1233,6 +1259,77 @@ void XCFImageFormat::setPalette(XCFImage &xcf_image, QImage &image)
 
     image.setColorTable(xcf_image.palette);
 }
+
+/*!
+ * Copy the parasites info to QImage.
+ * \param xcf_image XCF image containing the parasites read from the data stream.
+ * \param image image to apply the parasites data.
+ * \note Some comment taken from https://gitlab.gnome.org/GNOME/gimp/-/blob/master/devel-docs/parasites.txt
+ */
+void XCFImageFormat::setImageParasites(const XCFImage &xcf_image, QImage &image)
+{
+    auto&& p = xcf_image.parasites;
+    auto keys = p.keys();
+    for (auto &&key : std::as_const(keys)) {
+        auto value = p.value(key);
+        if(value.isEmpty())
+            continue;
+
+        // "icc-profile" (IMAGE, PERSISTENT | UNDOABLE)
+        //     This contains an ICC profile describing the color space the
+        //     image was produced in. TIFF images stored in PhotoShop do
+        //     oftentimes contain embedded profiles. An experimental color
+        //     manager exists to use this parasite, and it will be used
+        //     for interchange between TIFF and PNG (identical profiles)
+        if (key == QStringLiteral("icc-profile")) {
+            auto cs = QColorSpace::fromIccProfile(value);
+            if(cs.isValid())
+                image.setColorSpace(cs);
+            continue;
+        }
+
+        // "gimp-comment" (IMAGE, PERSISTENT)
+        //    Standard GIF-style image comments.  This parasite should be
+        //    human-readable text in UTF-8 encoding.  A trailing \0 might
+        //    be included and is not part of the comment.  Note that image
+        //    comments may also be present in the "gimp-metadata" parasite.
+        if (key == QStringLiteral("gimp-comment")) {
+            value.replace('\0', QByteArray());
+            image.setText(QStringLiteral("Comment"), QString::fromUtf8(value));
+            continue;
+        }
+
+        // "gimp-image-metadata"
+        //     Saved by GIMP 2.10.30 but it is not mentioned in the specification.
+        //     It is an XML block with the properties set using GIMP.
+        if (key == QStringLiteral("gimp-image-metadata")) {
+            // NOTE: I arbitrary defined the metadata "XML:org.gimp.xml" because it seems
+            //       a GIMP proprietary XML format (no xmlns defined)
+            value.replace('\0', QByteArray());
+            image.setText(QStringLiteral("XML:org.gimp.xml"), QString::fromUtf8(value));
+            continue;
+        }
+
+#if 0   // Unable to generate it using latest GIMP version
+        // "gimp-metadata" (IMAGE, PERSISTENT)
+        //     The metadata associated with the image, serialized as one XMP
+        //     packet.  This metadata includes the contents of any XMP, EXIF
+        //     and IPTC blocks from the original image, as well as
+        //     user-specified values such as image comment, copyright,
+        //     license, etc.
+        if (key == QStringLiteral("gimp-metadata")) {
+            // NOTE: "XML:com.adobe.xmp" is the meta set by Qt reader when an
+            //       XMP packet is found (e.g. when reading a PNG saved by Photoshop).
+            //       I reused the same key because some programs could search for it.
+            value.replace('\0', QByteArray());
+            image.setText(QStringLiteral("XML:com.adobe.xmp"), QString::fromUtf8(value));
+            continue;
+        }
+#endif
+
+    }
+}
+
 
 /*!
  * Copy the bytes from the tile buffer into the image tile QImage, taking into
@@ -1839,7 +1936,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
     switch (layer.type) {
     case RGB_GIMAGE:
         if (layer.opacity == OPAQUE_OPACITY) {
-            image = QImage(xcf_image.width, xcf_image.height, QImage::Format_RGB32);
+            image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_RGB32);
             if (image.isNull()) {
                 return false;
             }
@@ -1848,7 +1945,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
         } // else, fall through to 32-bit representation
         Q_FALLTHROUGH();
     case RGBA_GIMAGE:
-        image = QImage(xcf_image.width, xcf_image.height, QImage::Format_ARGB32);
+        image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_ARGB32);
         if (image.isNull()) {
             return false;
         }
@@ -1857,7 +1954,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
 
     case GRAY_GIMAGE:
         if (layer.opacity == OPAQUE_OPACITY) {
-            image = QImage(xcf_image.width, xcf_image.height, QImage::Format_Indexed8);
+            image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_Indexed8);
             image.setColorCount(256);
             if (image.isNull()) {
                 return false;
@@ -1868,7 +1965,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
         } // else, fall through to 32-bit representation
         Q_FALLTHROUGH();
     case GRAYA_GIMAGE:
-        image = QImage(xcf_image.width, xcf_image.height, QImage::Format_ARGB32);
+        image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_ARGB32);
         if (image.isNull()) {
             return false;
         }
@@ -1889,7 +1986,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
         // or two-color palette. Have to ask about this...
 
         if (xcf_image.num_colors <= 2) {
-            image = QImage(xcf_image.width, xcf_image.height, QImage::Format_MonoLSB);
+            image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_MonoLSB);
             image.setColorCount(xcf_image.num_colors);
             if (image.isNull()) {
                 return false;
@@ -1897,7 +1994,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
             image.fill(0);
             setPalette(xcf_image, image);
         } else if (xcf_image.num_colors <= 256) {
-            image = QImage(xcf_image.width, xcf_image.height, QImage::Format_Indexed8);
+            image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_Indexed8);
             image.setColorCount(xcf_image.num_colors);
             if (image.isNull()) {
                 return false;
@@ -1915,7 +2012,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
             xcf_image.palette[1] = xcf_image.palette[0];
             xcf_image.palette[0] = qRgba(255, 255, 255, 0);
 
-            image = QImage(xcf_image.width, xcf_image.height, QImage::Format_MonoLSB);
+            image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_MonoLSB);
             image.setColorCount(xcf_image.num_colors);
             if (image.isNull()) {
                 return false;
@@ -1931,7 +2028,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
             }
 
             xcf_image.palette[0] = qRgba(255, 255, 255, 0);
-            image = QImage(xcf_image.width, xcf_image.height, QImage::Format_Indexed8);
+            image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_Indexed8);
             image.setColorCount(xcf_image.num_colors);
             if (image.isNull()) {
                 return false;
@@ -1942,7 +2039,7 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
             // No room for a transparent color, so this has to be promoted to
             // true color. (There is no equivalent PNG representation output
             // from The GIMP as of v1.2.)
-            image = QImage(xcf_image.width, xcf_image.height, QImage::Format_ARGB32);
+            image = imageAlloc(xcf_image.width, xcf_image.height, QImage::Format_ARGB32);
             if (image.isNull()) {
                 return false;
             }
@@ -1953,11 +2050,11 @@ bool XCFImageFormat::initializeImage(XCFImage &xcf_image)
 
     if (xcf_image.x_resolution > 0 && xcf_image.y_resolution > 0) {
         const float dpmx = xcf_image.x_resolution * INCHESPERMETER;
-        if (dpmx > std::numeric_limits<int>::max()) {
+        if (dpmx > float(std::numeric_limits<int>::max())) {
             return false;
         }
         const float dpmy = xcf_image.y_resolution * INCHESPERMETER;
-        if (dpmy > std::numeric_limits<int>::max()) {
+        if (dpmy > float(std::numeric_limits<int>::max())) {
             return false;
         }
         image.setDotsPerMeterX((int)dpmx);
@@ -3192,10 +3289,59 @@ bool XCFHandler::write(const QImage &)
     return false;
 }
 
+bool XCFHandler::supportsOption(ImageOption option) const
+{
+    if (option == QImageIOHandler::Size)
+        return true;
+    return false;
+}
+
+QVariant XCFHandler::option(ImageOption option) const
+{
+    QVariant v;
+
+    if (option == QImageIOHandler::Size) {
+        /*
+         * The image structure always starts at offset 0 in the XCF file.
+         * byte[9]     "gimp xcf " File type identification
+         * byte[4]     version     XCF version
+         *                          "file": version 0
+         *                          "v001": version 1
+         *                          "v002": version 2
+         *                          "v003": version 3
+         * byte        0            Zero marks the end of the version tag.
+         * uint32      width        Width of canvas
+         * uint32      height       Height of canvas
+         */
+        if (auto d = device()) {
+            // transactions works on both random and sequential devices
+            d->startTransaction();
+            auto ba9 = d->read(9);      // "gimp xcf "
+            auto ba5 = d->read(4+1);    // version + null terminator
+            auto ba = d->read(8);       // width and height
+            d->rollbackTransaction();
+            if (ba9 == QByteArray("gimp xcf ") && ba5.size() == 5) {
+                QDataStream ds(ba);
+                quint32 width;
+                ds >> width;
+                quint32 height;
+                ds >> height;
+                if (ds.status() == QDataStream::Ok)
+                    v = QVariant::fromValue(QSize(width, height));
+            }
+        }
+    }
+
+    return v;
+}
+
 bool XCFHandler::canRead(QIODevice *device)
 {
     if (!device) {
         qCDebug(XCFPLUGIN) << "XCFHandler::canRead() called with no device";
+        return false;
+    }
+    if (device->isSequential()) {
         return false;
     }
 
